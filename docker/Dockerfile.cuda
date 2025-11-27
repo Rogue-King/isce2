@@ -1,116 +1,148 @@
-FROM hysds/cuda-dev:latest
+# --- Builder Stage ---
+FROM hysds/cuda-dev:latest as builder
 
-# Set an encoding to make things work smoothly.
+# Set encoding
 ENV LANG en_US.UTF-8
-
-# Set ISCE repo
 ENV ISCE_ORG isce-framework
 
-# set to root user
+# Set to root user
 USER root
 
-# install tools for RPM generation
+# 1. Install Build Tools & RPM Generation Tools (Consolidated)
+# Added libffi-devel which is often needed for the 'ffi' gem
 RUN set -ex \
- && yum update -y \
- && yum groupinstall -y "development tools" \
- && yum install -y \
-      make ruby-devel rpm-build rubygems \
- && gem install ffi -v 1.12.2 \
- && gem install --no-ri --no-rdoc fpm
+    && yum update -y \
+    && yum groupinstall -y "development tools" \
+    && yum install -y \
+        make \
+        ruby-devel \
+        rpm-build \
+        rubygems \
+        libffi-devel \
+        uuid-devel \
+        x11-devel \
+        motif-devel \
+        jq \
+        opencv \
+        opencv-devel \
+        opencv-python \
+        gcc-gfortran \
+    && gem install ffi -v 1.12.2 \
+    && gem install --no-ri --no-rdoc fpm \
+    && yum clean all \
+    && rm -rf /var/cache/yum
 
-# install isce requirements
+# 2. Install ISCE Requirements via Conda (Consolidated)
+# Added 'conda clean --all' to save space
 RUN set -ex \
- && . /opt/conda/bin/activate root \
- && conda install --yes \
-      cython \
-      gdal \
-      gfortran \
-      git \
-      h5py \
-      libgdal \
-      pytest \
-      numpy \
-      fftw \
-      scipy \
-      scons \
-      hdf4 \
-      hdf5 \
-      libgcc \
-      libstdcxx-ng \
-      cmake \
- && yum install -y uuid-devel x11-devel motif-devel jq \
-    opencv opencv-devel opencv-python \
- && ln -sf /opt/conda/bin/cython /opt/conda/bin/cython3 \
- && mkdir -p /opt/isce2/src
+    && . /opt/conda/bin/activate root \
+    && conda install --yes \
+        cython \
+        gdal \
+        gfortran \
+        git \
+        h5py \
+        libgdal \
+        pytest \
+        numpy \
+        fftw \
+        scipy \
+        scons \
+        hdf4 \
+        hdf5 \
+        libgcc \
+        libstdcxx-ng \
+        cmake \
+    && ln -sf /opt/conda/bin/cython /opt/conda/bin/cython3 \
+    && conda clean --all -f -y \
+    && mkdir -p /opt/isce2/src
 
-# override system libuuid into conda env to link in libXm and libXt
+# 3. System Library Fixes (Robust)
+# Fixing libuuid and libgfortran linking issues common in HySDS images
 RUN set -ex \
- && cd /opt/conda/lib \
- && unlink libuuid.so \
- && unlink libuuid.so.1 \
- && ln -s /lib64/libuuid.so.1.3.0 libuuid.so \
- && ln -s /lib64/libuuid.so.1.3.0 libuuid.so.1
+    && cd /opt/conda/lib \
+    # Force unlink to ensure we don't error if they exist/don't exist
+    && (unlink libuuid.so || true) \
+    && (unlink libuuid.so.1 || true) \
+    && ln -s /lib64/libuuid.so.1.3.0 libuuid.so \
+    && ln -s /lib64/libuuid.so.1.3.0 libuuid.so.1 \
+    && cd /lib64 \
+    && (test -f libgfortran.so || ln -sv libgfortran.so.*.* libgfortran.so)
 
-# install libgfortran.so.3 and create missing link
-RUN set -ex \
- && yum install -y gcc-gfortran \
- && cd /lib64 \
- && ( test -f libgfortran.so || ln -sv libgfortran.so.*.* libgfortran.so )
-
-# copy repo
+# Copy Repo
 COPY . /opt/isce2/src/isce2
 
-# build ISCE
+# 4. Build ISCE (SCons + RPM)
+# Changed 'source' to '.' for sh compatibility
 RUN set -ex \
- && . /opt/conda/bin/activate root \
- && cd /opt/isce2/src/isce2 \
- && source docker/build_env.sh \
- && mkdir -p $BUILD_DIR \
- && cp docker/SConfigISCE.cuda configuration/SConfigISCE \
- && scons install \
- && cp docker/isce_env.sh $ISCE_INSTALL_ROOT \
- && cd /tmp \
- && mkdir -p /tmp/rpm-build/opt \
- && mv $ISCE_INSTALL_ROOT /tmp/rpm-build/opt \
- && curl -s https://api.github.com/repos/$ISCE_ORG/isce2/git/refs/heads/main \
-    > /tmp/rpm-build/opt/isce2/version.json \
- && hash=$(cat /tmp/rpm-build/opt/isce2/version.json | jq -r .object.sha) \
- && short_hash=$(echo $hash | cut -c1-5) \
- && fpm -s dir -t rpm -C /tmp/rpm-build --name isce \
-      --prefix=/ --version=2.3 --provides=isce \
-      --maintainer=piyush.agram@jpl.nasa.gov \
-      --description="InSAR Scientific Computing Environment v2 (${hash})"
+    && . /opt/conda/bin/activate root \
+    && cd /opt/isce2/src/isce2 \
+    && . docker/build_env.sh \
+    && mkdir -p $BUILD_DIR \
+    && cp docker/SConfigISCE.cuda configuration/SConfigISCE \
+    && scons install \
+    && cp docker/isce_env.sh $ISCE_INSTALL_ROOT \
+    # Prepare RPM Directory Structure
+    && cd /tmp \
+    && mkdir -p /tmp/rpm-build/opt \
+    && mv $ISCE_INSTALL_ROOT /tmp/rpm-build/opt \
+    # Generate Version Info
+    && curl -s https://api.github.com/repos/$ISCE_ORG/isce2/git/refs/heads/main \
+       > /tmp/rpm-build/opt/isce2/version.json \
+    && hash=$(cat /tmp/rpm-build/opt/isce2/version.json | jq -r .object.sha) \
+    && short_hash=$(echo $hash | cut -c1-5) \
+    # Build RPM
+    && fpm -s dir -t rpm -C /tmp/rpm-build --name isce \
+       --prefix=/ --version=2.3 --provides=isce \
+       --maintainer=piyush.agram@jpl.nasa.gov \
+       --description="InSAR Scientific Computing Environment v2 (${hash})"
 
+# --- Production Stage ---
 FROM hysds/cuda-pge-base:latest
 
-# Set an encoding to make things work smoothly.
 ENV LANG en_US.UTF-8
 
-# install ISCE from RPM
-COPY --from=0 /tmp/isce-2.3-1.x86_64.rpm /tmp/isce-2.3-1.x86_64.rpm
+# COPY RPM from builder
+COPY --from=builder /tmp/isce-2.3-1.x86_64.rpm /tmp/isce-2.3-1.x86_64.rpm
 
-# install isce and its minimal requirements
+# 5. Install Runtime Dependencies & RPM
+# Combined sudo calls and added cleanup
 RUN set -ex \
- && sudo /opt/conda/bin/conda install --yes \
-      gdal \
-      h5py \
-      libgdal \
-      pytest \
-      numpy \
-      fftw \
-      scipy \
-      hdf4 \
-      hdf5 \
- && sudo yum update -y \
- && sudo yum install -y uuid-devel x11-devel motif-devel gcc-gfortran \
- && cd /opt/conda/lib \
- && sudo unlink libuuid.so \
- && sudo unlink libuuid.so.1 \
- && sudo ln -s /lib64/libuuid.so.1.3.0 libuuid.so \
- && sudo ln -s /lib64/libuuid.so.1.3.0 libuuid.so.1 \
- && cd /lib64 \
- && ( test -f libgfortran.so || sudo ln -sv libgfortran.so.*.* libgfortran.so ) \
- && sudo yum install -y /tmp/isce-2.3-1.x86_64.rpm \
- && sudo yum clean all \
- && sudo rm -rf /var/cache/yum \
- && sudo rm /tmp/isce-2.3-1.x86_64.rpm
+    && sudo /opt/conda/bin/conda install --yes \
+        gdal \
+        h5py \
+        libgdal \
+        pytest \
+        numpy \
+        fftw \
+        scipy \
+        hdf4 \
+        hdf5 \
+    && sudo /opt/conda/bin/conda clean --all -f -y \
+    && sudo yum update -y \
+    && sudo yum install -y \
+        uuid-devel \
+        x11-devel \
+        motif-devel \
+        gcc-gfortran \
+    # Apply Library Fixes to Runtime Image
+    && cd /opt/conda/lib \
+    && (sudo unlink libuuid.so || true) \
+    && (sudo unlink libuuid.so.1 || true) \
+    && sudo ln -s /lib64/libuuid.so.1.3.0 libuuid.so \
+    && sudo ln -s /lib64/libuuid.so.1.3.0 libuuid.so.1 \
+    && cd /lib64 \
+    && ( test -f libgfortran.so || sudo ln -sv libgfortran.so.*.* libgfortran.so ) \
+    # Install ISCE RPM
+    && sudo yum install -y /tmp/isce-2.3-1.x86_64.rpm \
+    && sudo yum clean all \
+    && sudo rm -rf /var/cache/yum \
+    && sudo rm /tmp/isce-2.3-1.x86_64.rpm
+
+# 6. CRITICAL: Set Runtime Environment Variables
+# These are necessary for Python to find the ISCE modules and for ISCE to run.
+# Adjust /opt/isce2 if the RPM installs strictly to /opt/isce2/install or similar.
+ENV ISCE_HOME="/opt/isce2"
+ENV ISCE_ROOT="/opt/isce2"
+ENV PATH="$ISCE_HOME/bin:$ISCE_HOME/applications:$PATH"
+ENV PYTHONPATH="$ISCE_HOME:$PYTHONPATH"
