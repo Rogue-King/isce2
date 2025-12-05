@@ -1,4 +1,4 @@
-# --- Builder Stage ---
+# --- Builder Stage: Compile ISCE2 ---
 FROM ubuntu:20.04 as builder
 
 # Set encoding and timezone
@@ -7,7 +7,6 @@ ENV TZ US/Pacific
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Install all build dependencies
-# ADDED: python3-dev (required for Python.h header files)
 RUN set -ex \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -52,7 +51,7 @@ RUN set -ex \
     && cpack -G DEB \
     && cp isce*.deb /tmp/
 
-# --- Production Stage ---
+# --- Production Stage: Install and Configure ---
 FROM ubuntu:20.04
 
 # Set encoding and timezone
@@ -60,13 +59,7 @@ ENV LANG en_US.UTF-8
 ENV TZ US/Pacific
 ARG DEBIAN_FRONTEND=noninteractive
 
-# *** PATH FIXES ***
-# Ensure executables are found
-ENV PATH="/opt/isce2/install/bin:$PATH"
-# Ensure Python can import the module
-ENV PYTHONPATH="/usr/lib/python3.8/dist-packages:$PYTHONPATH"
-
-# Install runtime dependencies (python3-dev is NOT needed here, just python3)
+# Install runtime dependencies
 RUN set -ex \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -78,20 +71,47 @@ RUN set -ex \
         libopencv-core4.2 \
         libopencv-highgui4.2 \
         libopencv-imgproc4.2 \
+        python3-opencv \
         python3-gdal \
         python3-h5py \
         python3-numpy \
         python3-scipy \
+        python3-matplotlib \
+        zip \
+        unzip \
+        curl \
+        wget \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && echo done
 
-# Install ISCE from DEB
+# 1. Install ISCE from DEB
 COPY --from=builder /tmp/isce*.deb /tmp/isce2.deb
-
 RUN set -ex \
     && dpkg -i /tmp/isce2.deb \
     && rm /tmp/isce2.deb
 
-# Symlink compatibility
-RUN ln -s /usr/lib/python3.8/dist-packages/isce2 /usr/lib/python3.8/dist-packages/isce
+# 2. Setup Stack Processors (contrib)
+COPY --from=builder /opt/isce2/src/isce2/contrib /opt/isce2/contrib
+
+# 3. Symlink Stack Scripts to /usr/local/bin (ROBUST FIX)
+# Instead of relying on PATH variables which can be overwritten, we link executables
+# directly to a standard system bin directory.
+RUN chmod -R +x /opt/isce2/contrib/stack \
+    && ln -sf /opt/isce2/contrib/stack/topsStack/*.py /usr/local/bin/ \
+    && ln -sf /opt/isce2/contrib/stack/stripmapStack/*.py /usr/local/bin/
+
+# 4. Configure Environment Variables
+# ISCE_HOME: Hardcoded location of binaries
+# PATH: Add ISCE main bin (Stack scripts are now in /usr/local/bin so they don't need PATH entry)
+# PYTHONPATH: Add 'contrib/stack' so python can find the modules "topsStack" and "stripmapStack"
+ENV ISCE_HOME="/opt/isce2/install"
+ENV PATH="$ISCE_HOME/bin:$PATH"
+ENV PYTHONPATH="/opt/isce2/contrib/stack:/usr/lib/python3.8/dist-packages:$PYTHONPATH"
+
+# 5. Compatibility Fixes
+# - Symlink 'isce2' to 'isce' for scripts expecting the old package name.
+# - Patch __init__.py with 'stanford_license = True' because stack processors (legacy)
+#   still check for this attribute, even though ISCE2 is now open source.
+RUN ln -s /usr/lib/python3.8/dist-packages/isce2 /usr/lib/python3.8/dist-packages/isce \
+    && echo "stanford_license = True" >> /usr/lib/python3.8/dist-packages/isce2/__init__.py
